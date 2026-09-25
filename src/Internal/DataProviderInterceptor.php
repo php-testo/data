@@ -150,50 +150,6 @@ final readonly class DataProviderInterceptor implements TestRunInterceptor
         return $finalResult;
     }
 
-    /**
-     * Run a single data set.
-     *
-     * @param TestInfo $info Test information.
-     * @param non-empty-string $label Unique label for the data set.
-     * @param int<0, max>|null $providerNum Data provider number or null if only one.
-     * @param int<0, max> $datasetNum Data set number.
-     * @param callable(TestInfo): TestResult $next Next interceptor or core logic to run the test.
-     * @param TestIdentity $identity Address of this data set, derived from the batch's.
-     */
-    private function run(
-        TestInfo $info,
-        callable $next,
-        string $label,
-        ?int $providerNum,
-        int $datasetNum,
-        array $arguments,
-        TestIdentity $identity,
-    ): TestResult {
-        $newInfo = $info->with(
-            arguments: $arguments,
-            identity: $identity,
-        );
-
-        // Dispatch dataset starting event
-        $this->eventDispatcher->dispatch(new TestDataSetStarting($newInfo, $label, $providerNum, $datasetNum));
-
-        try {
-            $result = $next($newInfo);
-        } catch (\Throwable $throwable) {
-            # Counts stay empty here; the aggregate's fold stamps each data set's final status.
-            $result = new TestResult(
-                info: $newInfo,
-                status: Status::Error,
-                failure: $throwable,
-            );
-        }
-
-        // Dispatch dataset finished event
-        $this->eventDispatcher->dispatch(new TestDataSetFinished($newInfo, $result, $label, $providerNum, $datasetNum));
-
-        return $result;
-    }
-
     private static function extractDataSets(TestInfo $info, object $attr): iterable
     {
         return match (true) {
@@ -213,23 +169,31 @@ final readonly class DataProviderInterceptor implements TestRunInterceptor
     {
         $provider = $attribute->provider;
 
-        # String provider definition means the method name in the test class
+        # String provider definition means the method name in the test class. The name resolves
+        # against the class the test runs in, not the one declaring the method: a test inherited
+        # from an abstract base may take its provider from the concrete subclass.
         $ref = $info->testDefinition->reflection;
         if (\is_string($provider) && $ref instanceof \ReflectionMethod) {
-            /** @var \ReflectionClass $class */
-            $class = $ref->getDeclaringClass();
+            $class = $info->caseInfo->definition->reflection ?? $ref->getDeclaringClass();
 
             if ($class->hasMethod($provider)) {
                 $m = $class->getMethod($provider);
+                $m->isAbstract() and throw new \LogicException(\sprintf(
+                    'DataProvider method %s::%s() is abstract.',
+                    $class->getName(),
+                    $provider,
+                ));
                 $provider = match (true) {
                     $m->isStatic() => $m->getClosure(),
                     default => $m->getClosure(($info->caseInfo->instance ?? throw new \LogicException("Cannot use non-static DataProvider '{$provider}': test has no class instance."))->getInstance()),
                 };
             }
 
-            \is_callable($provider) or throw new \InvalidArgumentException(
-                'DataProvider provider must be a callable or method name string.',
-            );
+            \is_callable($provider) or throw new \InvalidArgumentException(\sprintf(
+                'DataProvider method %s::%s() not found.',
+                $class->getName(),
+                $provider,
+            ));
         }
 
         # Fetch data sets from the provider
@@ -334,5 +298,49 @@ final readonly class DataProviderInterceptor implements TestRunInterceptor
         foreach ($attr->providers as $providerAttr) {
             yield from self::extractDataSets($info, $providerAttr);
         }
+    }
+
+    /**
+     * Run a single data set.
+     *
+     * @param TestInfo $info Test information.
+     * @param non-empty-string $label Unique label for the data set.
+     * @param int<0, max>|null $providerNum Data provider number or null if only one.
+     * @param int<0, max> $datasetNum Data set number.
+     * @param callable(TestInfo): TestResult $next Next interceptor or core logic to run the test.
+     * @param TestIdentity $identity Address of this data set, derived from the batch's.
+     */
+    private function run(
+        TestInfo $info,
+        callable $next,
+        string $label,
+        ?int $providerNum,
+        int $datasetNum,
+        array $arguments,
+        TestIdentity $identity,
+    ): TestResult {
+        $newInfo = $info->with(
+            arguments: $arguments,
+            identity: $identity,
+        );
+
+        // Dispatch dataset starting event
+        $this->eventDispatcher->dispatch(new TestDataSetStarting($newInfo, $label, $providerNum, $datasetNum));
+
+        try {
+            $result = $next($newInfo);
+        } catch (\Throwable $throwable) {
+            # Counts stay empty here; the aggregate's fold stamps each data set's final status.
+            $result = new TestResult(
+                info: $newInfo,
+                status: Status::Error,
+                failure: $throwable,
+            );
+        }
+
+        // Dispatch dataset finished event
+        $this->eventDispatcher->dispatch(new TestDataSetFinished($newInfo, $result, $label, $providerNum, $datasetNum));
+
+        return $result;
     }
 }
